@@ -6,14 +6,14 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-# ---------- CONFIG ----------
+# CONFIG
 API_URL = (st.secrets.get("API_URL") or os.getenv("API_URL") or "https://credit-scoring-api-8j5p.onrender.com")
 CLIENTS_CSV = "../Sources/clients.csv"
 DEFAULT_FEATURES_TO_SHOW = ["EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3","PAYMENT_RATE","DAYS_EMPLOYED"]
 
 st.set_page_config(page_title="Dashboard Scoring Crédit", layout="wide")
 
-# ---------- ACCESSIBILITÉ ----------
+# ACCESSIBILITÉ
 with st.sidebar:
     st.header("Réglages d’accessibilité")
     big_font = st.checkbox("Texte agrandi", value=True)
@@ -30,7 +30,7 @@ COLOR_NEU = "#4d4d4d"  # gris sombre
 if high_contrast:
     COLOR_POS, COLOR_NEG, COLOR_NEU = "#00429d", "#d1495b", "#111111"
 
-# ---------- HELPERS ----------
+# HELPERS
 @st.cache_data(show_spinner=False)
 def load_clients():
     df = pd.read_csv(CLIENTS_CSV)
@@ -48,6 +48,20 @@ def api_predict(features: dict, threshold: float | None = None):
     r = requests.post(f"{API_URL}/predict", json=payload, timeout=30)
     r.raise_for_status()
     return r.json()
+
+
+def api_explain_global(top_k: int = 20):
+    r = requests.get(f"{API_URL}/explain_global", params={"top_k": top_k}, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_explain_local(features: dict, top_k: int = 12):
+    payload = {"features": features, "top_k": top_k}
+    r = requests.post(f"{API_URL}/explain_local", json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
 
 def gauge_distance(prob, thr):
     # jauge simple : barre horizontale + repères
@@ -81,13 +95,13 @@ def feature_hist(df, feature, client_value, segment_mask=None):
     if show_value_labels:
         st.caption(f"Valeur client : **{client_value}**")
 
-# ---------- DATA ----------
+#DATA
 df_clients = load_clients()
 health = api_health()
 THRESHOLD = float(health.get("threshold", 0.5))
 st.success(f"API OK · seuil métier = **{THRESHOLD:.3f}**")
 
-# ---------- UI : sélection client ----------
+# UI : sélection client
 st.header("Dashboard Scoring Crédit")
 left, right = st.columns([1,2])
 
@@ -124,8 +138,70 @@ with right:
     )
 
 st.markdown("---")
+st.subheader("Explications (SHAP)")
 
-# ---------- COMPARAISON ----------
+# A) Importance globale (mean |SHAP|, classe 1 = Refuser)
+try:
+    gl = api_explain_global(top_k=20)
+    importances = gl.get("importances", [])
+    if importances:
+        df_gl = pd.DataFrame(importances)
+        chart_gl = (
+            alt.Chart(df_gl)
+            .mark_bar()
+            .encode(
+                x=alt.X("mean_abs_shap:Q", title="Importance moyenne absolue (mean |SHAP|)"),
+                y=alt.Y("feature:N", sort="-x", title="Variable"),
+                tooltip=["feature","mean_abs_shap"]
+            )
+            .properties(height=22 * min(20, len(df_gl)))
+        )
+        st.altair_chart(chart_gl, use_container_width=True)
+        st.caption("Les barres indiquent l'importance globale moyenne absolue (classe 1 = Refuser).")
+    else:
+        st.warning("Importance globale indisponible (liste vide).")
+except Exception as e:
+    st.error(f"Erreur /explain_global : {e}")
+
+# B) Explication locale (top contributions pour CE client)
+try:
+    loc = api_explain_local(features_payload, top_k=12)
+    proba_loc = float(loc.get("probability", np.nan))
+    topc = pd.DataFrame(loc.get("top_contributions", []))
+    if not topc.empty:
+        # signe lisible
+        topc["signe"] = np.where(topc["shap_value"] > 0, "↑ Refuser", "↓ Accepter")
+        # tri du plus impactant au moins impactant
+        topc = topc.sort_values("shap_value", ascending=False)
+        # palette
+        dom = ["↑ Refuser", "↓ Accepter"]
+        rng = [COLOR_NEG, COLOR_POS]
+
+        chart_loc = (
+            alt.Chart(topc)
+            .mark_bar()
+            .encode(
+                x=alt.X("shap_value:Q", title="Contribution SHAP (±)"),
+                y=alt.Y("feature:N", sort=alt.SortField(field="shap_value", order="descending"), title="Variable"),
+                color=alt.Color("signe:N", scale=alt.Scale(domain=dom, range=rng)),
+                tooltip=["feature","value","shap_value","signe"]
+            )
+            .properties(height=24 * len(topc))
+        )
+        st.altair_chart(chart_loc, use_container_width=True)
+        st.caption("Barres **positives** → poussent vers **Refuser** ; **négatives** → vers **Accepter**.")
+
+        if show_value_labels:
+            st.dataframe(topc[["feature","value","shap_value","signe"]].rename(
+                columns={"feature":"Variable","value":"Valeur","shap_value":"SHAP","signe":"Sens"}
+            ))
+    else:
+        st.warning("Explication locale indisponible (aucune contribution renvoyée).")
+except Exception as e:
+    st.error(f"Erreur /explain_local : {e}")
+
+
+# COMPARAISON
 st.subheader("Comparaison client vs cohorte / segment")
 cols = st.columns(3)
 with cols[0]:
@@ -143,17 +219,18 @@ with cols[2]:
 client_val = row[feature_to_plot]
 feature_hist(df_clients, feature_to_plot, client_val, segment_mask=seg_mask)
 
-# ---------- WHAT-IF (optionnel) ----------
+# WHAT-IF
 st.markdown("---")
 st.subheader("What-if : modifier des caractéristiques et recalculer")
 cols = st.columns(len(DEFAULT_FEATURES_TO_SHOW))
 edited = {}
 for i, f in enumerate(DEFAULT_FEATURES_TO_SHOW):
     if f in df_clients.columns:
-        default = None if pd.isna(row[f]) else float(row[f] and pd.api.types.is_numeric_dtype(df_clients[f]))
+        is_num = pd.api.types.is_numeric_dtype(df_clients[f])
+        default = float(row[f]) if (is_num and not pd.isna(row[f])) else 0.0
         with cols[i]:
-            edited[f] = st.number_input(f, value=default if default is not None else 0.0)
-
+            edited[f] = st.number_input(f, value=default, key=f"whatif_{f}")
+            
 if st.button("Recalculer"):
     payload = features_payload.copy()
     payload.update({k: (None if v is None else float(v)) for k, v in edited.items()})
