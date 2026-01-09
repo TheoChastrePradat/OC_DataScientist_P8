@@ -8,10 +8,17 @@ import altair as alt
 
 # CONFIG
 API_URL = (st.secrets.get("API_URL") or os.getenv("API_URL") or "https://credit-scoring-api-8j5p.onrender.com")
+# API_LOCAL = (st.secrets.get("API_LOCAL") or os.getenv("API_LOCAL"))
+
+API = API_URL
+
 CLIENTS_CSV = "../Sources/clients.csv"
 DEFAULT_FEATURES_TO_SHOW = ["EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3","PAYMENT_RATE","DAYS_EMPLOYED"]
 
 st.set_page_config(page_title="Dashboard Scoring Crédit", layout="wide")
+
+SESSION = requests.Session()
+DEFAULT_TIMEOUT = 180
 
 # ACCESSIBILITÉ
 with st.sidebar:
@@ -36,31 +43,39 @@ def load_clients():
     df = pd.read_csv(CLIENTS_CSV)
     return df
 
+
+def _with_retry(fn, *args, **kwargs):
+    tries = 3
+    for i in range(tries):
+        try:
+            return fn(*args, **kwargs)
+        except requests.exceptions.Timeout as e:
+            if i == tries - 1:
+                raise e
+        except requests.exceptions.ConnectionError as e:
+            if i == tries - 1:
+                raise e
+
+
 def api_health():
-    r = requests.get(f"{API_URL}/health", timeout=10)
-    r.raise_for_status()
-    return r.json()
+    return _with_retry(SESSION.get, f"{API}/health", timeout=DEFAULT_TIMEOUT).json()
 
 def api_predict(features: dict, threshold: float | None = None):
     payload = {"features": features}
     if threshold is not None:
         payload["threshold"] = float(threshold)
-    r = requests.post(f"{API_URL}/predict", json=payload, timeout=30)
+    r = requests.post(f"{API}/predict", json=payload, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
 def api_explain_global(top_k: int = 20):
-    r = requests.get(f"{API_URL}/explain_global", params={"top_k": top_k}, timeout=60)
-    r.raise_for_status()
-    return r.json()
+    return _with_retry(SESSION.get, f"{API}/explain_global", params={"top_k": top_k}, timeout=DEFAULT_TIMEOUT).json()
 
 
 def api_explain_local(features: dict, top_k: int = 12):
     payload = {"features": features, "top_k": top_k}
-    r = requests.post(f"{API_URL}/explain_local", json=payload, timeout=60)
-    r.raise_for_status()
-    return r.json()
+    return _with_retry(SESSION.post, f"{API}/explain_local", json=payload, timeout=DEFAULT_TIMEOUT).json()
 
 
 def gauge_distance(prob, thr):
@@ -100,6 +115,13 @@ df_clients = load_clients()
 health = api_health()
 THRESHOLD = float(health.get("threshold", 0.5))
 st.success(f"API OK · seuil métier = **{THRESHOLD:.3f}**")
+
+with st.spinner("Initialisation de l'explicabilite..."):
+    try:
+        _ = api_explain_global(top_k=5)
+    except Exception as e:
+        st.error(f"Erreur lors de l'initialisation de l'explicabilité globale : {e}")
+        pass
 
 # UI : sélection client
 st.header("Dashboard Scoring Crédit")
